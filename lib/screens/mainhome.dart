@@ -9,6 +9,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class Mainhome extends StatefulWidget {
   const Mainhome({super.key});
@@ -16,7 +17,7 @@ class Mainhome extends StatefulWidget {
   State<Mainhome> createState() => _MainhomeState();
 }
 
-class _MainhomeState extends State<Mainhome> {
+class _MainhomeState extends State<Mainhome> with WidgetsBindingObserver {
   // === Nordic UART Service (NUS) ===
   final Guid nusService = Guid("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
   final Guid nusRxChar = Guid(
@@ -39,16 +40,36 @@ class _MainhomeState extends State<Mainhome> {
   StreamSubscription<BluetoothConnectionState>? _connSub;
   StreamSubscription<List<int>>? _notifySub;
   Timer? _rssiTimer;
+  bool _userWantsConnect = false;
+
+  Duration _reconnectDelay = const Duration(seconds: 1);
+  final Duration _maxReconnectDelay = const Duration(seconds: 20);
+
+  bool _restoring = false; // 🟦 중복 호출 가드
+  bool _didRestoreOnce = false; // 🟦 이번 런치에서 1회 보장
 
   // 수신 파서 버퍼 (문자열 프레이밍: \n 기준)
   final StringBuffer _rxBuf = StringBuffer();
-
-  String _lastDataText = '-'; //    최근 수신 데이터 텍스트
 
   @override
   void initState() {
     super.initState();
     initForegroundTask();
+    WidgetsBinding.instance.addObserver(this);
+    _restoreConnectIntent();
+
+    // 콜드스타트: 첫 빌드가 끝난 직후에 복원 시도 (알림 첫 탭 케이스 커버)      // 🟦
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _restoreConnectIntent();
+    }); // 🟦🟦
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final ignoring =
+          await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+      if (!ignoring) {
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      }
+    });
   }
 
   @override
@@ -58,6 +79,7 @@ class _MainhomeState extends State<Mainhome> {
     _notifySub?.cancel();
     _connSub?.cancel();
     _device?.disconnect();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -98,6 +120,74 @@ class _MainhomeState extends State<Mainhome> {
     return false;
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 🟦
+    if (state == AppLifecycleState.resumed) {
+      // 🟦
+      _restoreConnectIntent(); // 🟦 포그라운드 복귀도 동일 처리
+    }
+  }
+
+  // 앱 시작 시 복원
+  Future<void> _restoreConnectIntent() async {
+    // 🟦
+    if (_restoring) return; // 🟦 중복 방지
+    _restoring = true; // 🟦
+    try {
+      if (_didRestoreOnce && _connState == BluetoothConnectionState.connected) {
+        return; // 🟦 이미 성공했으면 스킵
+      }
+
+      // 1) 권한/BT ON 확인
+      if (!await _ensurePermissions()) {
+        // 🟦
+        setState(() => _status = '권한을 허용해 주세요.'); // 🟦
+        return; // 🟦
+      }
+      if (!await _ensureBluetoothOn()) return; // 🟦
+
+      // 2) 저장된 '연결 의지' 복원
+      final prefs = await SharedPreferences.getInstance(); // 🟦
+      final want = prefs.getBool('wantConnect') ?? false; // 🟦
+      if (!want) return; // 🟦 사용자가 원치 않으면 스킵
+      _userWantsConnect = true; // 🟦
+
+      // 3) 이미 붙어있으면 종료
+      if (_device != null && _connState == BluetoothConnectionState.connected) {
+        _didRestoreOnce = true; // 🟦
+        return; // 🟦
+      }
+
+      // 4) 최근 기기 ID가 있으면 직접 붙기 → 실패하면 스캔으로 폴백
+      final lastId = prefs.getString('lastDeviceId'); // 🟦
+      if (lastId != null && lastId.isNotEmpty) {
+        // 🟦
+        try {
+          // flutter_blue_plus에서 지원하는 방식에 맞게 생성 (버전에 따라 다름)   // 🟦
+          final dev = BluetoothDevice.fromId(lastId); // 🟦
+          await dev.connect(
+            autoConnect: false,
+            timeout: const Duration(seconds: 8),
+          ); // 🟦
+          _device = dev; // 🟦
+          setState(() => _connState = BluetoothConnectionState.connected); // 🟦
+          await _afterConnected(); // 🟦 (MTU/우선순위/RSSI 시작)
+          _didRestoreOnce = true; // 🟦
+          return; // 🟦
+        } catch (e) {
+          debugPrint('직접 재연결 실패, 스캔으로 폴백: $e'); // 🟦
+        }
+      }
+
+      // 5) 폴백: 기존 버튼 로직과 동일하게 스캔-연결
+      await _scanAndConnect(); // 🟦
+      _didRestoreOnce = true; // 🟦
+    } finally {
+      _restoring = false; // 🟦
+    }
+  }
+
   // ---- 스캔 시작/정지 ----
   Future<void> _scanAndConnect() async {
     if (!await _ensurePermissions()) {
@@ -113,6 +203,14 @@ class _MainhomeState extends State<Mainhome> {
       _rxBuf.clear();
       _recvLog.clear();
     });
+
+    _userWantsConnect = true; // 🟦 사용자가 연결을 원함 표시
+    final prefs = await SharedPreferences.getInstance(); // 🟦
+    await prefs.setBool('wantConnect', true);
+    if (_device != null) {
+      // 🟦
+      await prefs.setString('lastDeviceId', _device!.remoteId.str); // 🟦
+    }
 
     // 이전 스캔 정리
     try {
@@ -164,6 +262,17 @@ class _MainhomeState extends State<Mainhome> {
             // ✅ 연결 성공이면 Foreground 시작 + (선택) deviceId 전달
             if (_device != null &&
                 _connState == BluetoothConnectionState.connected) {
+              _connSub?.cancel(); // 🟦 기존 구독 정리
+              _connSub = _device!.connectionState.listen((s) {
+                // 🟦 상태 감시
+                setState(() => _connState = s); // 🟦
+                if (s == BluetoothConnectionState.disconnected &&
+                    _userWantsConnect) {
+                  // 필요 시 여기서 재연결 시도 로직을 넣을 수 있습니다. // 🟦
+                  // 예: _device!.connect(autoConnect: false).catchError((_) {});
+                }
+              });
+              _startRssi(); // 🟦 (RSSI -> 서비스로 push는 이미 추가하신 부분이 실행됨)
               try {
                 debugPrint('>>> Foreground startService 호출');
                 final ok = await FlutterForegroundTask.startService(
@@ -453,6 +562,10 @@ class _MainhomeState extends State<Mainhome> {
   // ---- 수동 연결 해제 ----
   Future<void> _disconnect() async {
     // (안전) 스캔 중지
+    _userWantsConnect = false; // 🟦 사용자가 더 이상 연결 원하지 않음 (자동 재연결 중단)
+    final prefs = await SharedPreferences.getInstance(); // 🟦
+    await prefs.setBool('wantConnect', false);
+
     try {
       if (FlutterBluePlus.isScanningNow) {
         await FlutterBluePlus.stopScan();
@@ -485,6 +598,77 @@ class _MainhomeState extends State<Mainhome> {
       _lastRssi = null;
       _rxBuf.clear();
       _recvLog.clear();
+    });
+  }
+
+  // --- 연결 시도(재시도 포함) ---
+  Future<void> _connectWithRetry() async {
+    // 🟦
+    if (_device == null) return; // 🟦
+    while (_userWantsConnect &&
+        _connState != BluetoothConnectionState.connected) {
+      try {
+        await _device!.connect(
+          // 🟦
+          autoConnect: false, // 🟦 (직접 재시도 전략과 궁합 좋음)
+          timeout: const Duration(seconds: 8), // 🟦
+        );
+        // 연결 성공 → 품질 힌트 & MTU 업, RSSI 루프 등
+        await _afterConnected(); // 🟦
+        _reconnectDelay = const Duration(seconds: 1); // 🟦 (백오프 초기화)
+        return; // 🟦
+      } catch (_) {
+        // 실패 → 백오프 후 재시도
+        await Future.delayed(_reconnectDelay); // 🟦
+        final next = _reconnectDelay.inSeconds * 2; // 🟦
+        _reconnectDelay = Duration(
+          seconds: next.clamp(1, _maxReconnectDelay.inSeconds),
+        ); // 🟦
+      }
+    }
+  }
+
+  // --- 연결 후 품질 힌트/감시 ---
+  Future<void> _afterConnected() async {
+    // 🟦
+    try {
+      await _device?.requestConnectionPriority(
+        connectionPriorityRequest: ConnectionPriority.high, // 🟦 변경된 API
+      ); // 🟦 가용 시
+      await _device?.requestMtu(185); // 🟦 가용 시(ESP32 대응)
+      _startRssi(); // (서비스로 RSSI push 포함)
+    } catch (_) {}
+
+    // 연결 성공 후에만 저장
+    if (_device != null && _connState == BluetoothConnectionState.connected) {
+      // 🟦
+      final prefs = await SharedPreferences.getInstance(); // 🟦
+      await prefs.setString('lastDeviceId', _device!.remoteId.str); // 🟦
+      await prefs.setBool('wantConnect', true); // 🟦
+    }
+
+    _watchConnection(); // 🟦 상태 감시 시작
+    _startRssi(); // 🟦 주기적 RSSI(keep-alive 효과)
+    // ★ 여기서 서비스에 bindDevice 알림을 보내고 싶다면 보냅니다.
+  }
+
+  // --- 상태 스트림 구독 ---
+  void _watchConnection() {
+    // 🟦
+    _connSub?.cancel(); // 🟦
+    _connSub = _device!.connectionState.listen((s) async {
+      // 🟦
+      setState(() => _connState = s); // 🟦
+
+      if (s == BluetoothConnectionState.disconnected) {
+        // 🟦
+        // 주기 작업 정리
+        _cancelRssi(); // 🟦
+        if (_userWantsConnect) {
+          // 🟦 수동 해제가 아니면 자동 재연결
+          await _connectWithRetry(); // 🟦
+        }
+      }
     });
   }
 

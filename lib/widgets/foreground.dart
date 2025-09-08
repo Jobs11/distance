@@ -1,5 +1,3 @@
-import 'dart:isolate';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
@@ -7,7 +5,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 void initForegroundTask() {
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
-      channelId: 'bt_service_v5', // ← 새 채널 ID로 변경
+      channelId: 'bt_service_v7', // ← 새 채널 ID로 변경
       channelName: 'Bluetooth Background Service',
       channelDescription: 'ESP32 블루투스 연결 유지 서비스',
       channelImportance: NotificationChannelImportance.HIGH, // 중요

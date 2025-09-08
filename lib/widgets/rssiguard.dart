@@ -19,7 +19,7 @@ class _RssiGuardState extends State<RssiGuard> {
   static const int movingWindow = 5; // 이동 평균 샘플 개수
   static const int triggerConsecutive = 3; // 연속 하락 횟수
   static const int cooldownMs = 5000; // 진동 쿨다운 5초
-  static const int rssiFarThreshold = -50; // 이 값보다 작으면 "멀다"
+  static const int rssiFarThreshold = -70; // 이 값보다 작으면 "멀다"
 
   final List<int> _rssiBuf = [];
   int _consecutiveBelow = 0;
