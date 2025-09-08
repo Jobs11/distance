@@ -5,6 +5,7 @@ import 'package:distance/widgets/foreground.dart';
 import 'package:distance/widgets/rssiguard.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -58,17 +59,34 @@ class _MainhomeState extends State<Mainhome> {
     super.dispose();
   }
 
-  // ---- 권한 / 어댑터 가드 ----
+  /// ---- 권한 / 어댑터 가드 ----
   Future<bool> _ensurePermissions() async {
     if (!Platform.isAndroid) return true;
+
+    // 1. 기본 권한 (permission_handler)
     final res = await [
-      Permission.notification,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      // Android 11↓ 테스트면 위치 권한도 추가:
+      Permission.notification, // POST_NOTIFICATIONS
+      Permission.bluetoothScan, // BLE 스캔
+      Permission.bluetoothConnect, // BLE 연결
+      // Android 11 이하 테스트 시 필요할 수 있음
       // Permission.locationWhenInUse,
     ].request();
-    return res.values.every((s) => s.isGranted);
+
+    final granted = res.values.every((s) => s.isGranted);
+    if (!granted) return false;
+
+    // 2. 배터리 최적화 예외 (flutter_foreground_task)
+    final isIgnoring =
+        await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+    if (!isIgnoring) {
+      final requested =
+          await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      if (!requested) {
+        debugPrint("⚠️ 배터리 최적화 예외 거부됨 → 서비스가 중단될 수 있음");
+      }
+    }
+
+    return true;
   }
 
   Future<bool> _ensureBluetoothOn() async {
@@ -94,43 +112,102 @@ class _MainhomeState extends State<Mainhome> {
       _recvLog.clear();
     });
 
-    // 이전 스캔이 살아있다면 정리
+    // 이전 스캔 정리
     try {
       if (FlutterBluePlus.isScanningNow) {
         await FlutterBluePlus.stopScan();
       }
     } catch (_) {}
 
-    // ★★ withServices 필터 제거 + 스캔 모드 LowLatency
+    // 스캔 시작
     await FlutterBluePlus.startScan(
       timeout: const Duration(seconds: 8),
       androidScanMode: AndroidScanMode.lowLatency,
     );
 
-    _scanSub?.cancel();
-    _scanSub = FlutterBluePlus.scanResults.listen((results) async {
-      for (final r in results) {
-        final name = r.advertisementData.advName.isNotEmpty
-            ? r.advertisementData.advName
-            : r.device.platformName;
+    // 기존 리스너 제거 후 새로 구독
+    await _scanSub?.cancel();
+    _scanSub = FlutterBluePlus.scanResults.listen(
+      (results) async {
+        for (final r in results) {
+          final name = r.advertisementData.advName.isNotEmpty
+              ? r.advertisementData.advName
+              : r.device.platformName;
 
-        // 1) 이름에 ESP32 포함 시 우선 연결
-        if (name.toUpperCase().contains('ESP32')) {
-          await _onDeviceFound(r.device, name);
-          return;
-        }
+          final upper = name.toUpperCase();
 
-        // 2) (보조) 광고에 서비스 UUID가 실려온다면 그때도 잡기
-        // 일부 보드/설정에서는 serviceUuids가 비어있을 수 있음
-        final su = r.advertisementData.serviceUuids
-            .map((g) => g.toString().toLowerCase())
-            .toList();
-        if (su.contains(nusService.toString().toLowerCase())) {
-          await _onDeviceFound(r.device, name.isEmpty ? 'ESP32(NUS)' : name);
-          return;
+          // 후보 판정
+          final isEspByName = upper.contains('ESP32');
+          final su = r.advertisementData.serviceUuids
+              .map((g) => g.toString().toLowerCase())
+              .toList();
+          final isEspBySvc = su.contains(
+            nusService.toString().toLowerCase(),
+          ); // NUS 광고 포함 시
+
+          if (isEspByName || isEspBySvc) {
+            // ✅ 일단 스캔 중지(중복 연결 방지)
+            try {
+              if (FlutterBluePlus.isScanningNow) {
+                await FlutterBluePlus.stopScan();
+              }
+            } catch (_) {}
+
+            // ✅ 연결 시도
+            final display = isEspByName
+                ? name
+                : (name.isEmpty ? 'ESP32(NUS)' : name);
+            await _onDeviceFound(r.device, display);
+
+            // ✅ 연결 성공이면 Foreground 시작 + (선택) deviceId 전달
+            if (_device != null &&
+                _connState == BluetoothConnectionState.connected) {
+              try {
+                debugPrint('>>> Foreground startService 호출');
+                final ok = await FlutterForegroundTask.startService(
+                  notificationTitle: '앱 실행 중',
+                  notificationText: 'ESP32와 블루투스 연결 유지 중...',
+                  callback:
+                      startCallback, // ★ top-level + @pragma('vm:entry-point')
+                );
+                debugPrint('>>> startService 반환: $ok');
+
+                // 잠깐 대기 후 서비스 실행 여부 확인
+                await Future.delayed(const Duration(milliseconds: 500));
+                final running = await FlutterForegroundTask.isRunningService;
+                debugPrint('>>> isRunningService: $running');
+
+                // 알림 강제 갱신(보이면 정상)
+                await FlutterForegroundTask.updateService(
+                  notificationTitle: 'ESP32 연결 대기',
+                  notificationText: 'Foreground 준비 완료',
+                );
+                debugPrint('>>> updateService 호출 완료');
+
+                // ★ 실제로 서비스가 돌아간 뒤에 기기 정보 전달
+                if (running) {
+                  final id = _device!.remoteId.str;
+                  final displayName = display; // 네가 위에서 만든 name/display
+                  FlutterForegroundTask.sendDataToTask({
+                    'cmd': 'bindDevice',
+                    'deviceId': id,
+                    'name': displayName,
+                  });
+                  debugPrint('>>> bindDevice 데이터 전송 완료');
+                }
+              } catch (e, st) {
+                debugPrint('!!! startService 예외: $e\n$st');
+              }
+            }
+
+            return; // 하나만 잡고 종료
+          }
         }
-      }
-    }, onError: (e) => setState(() => _status = '스캔 오류: $e'));
+      },
+      onError: (e) {
+        setState(() => _status = '스캔 오류: $e');
+      },
+    );
   }
 
   Future<void> _onDeviceFound(BluetoothDevice dev, String name) async {
@@ -355,11 +432,33 @@ class _MainhomeState extends State<Mainhome> {
   }
 
   // ---- 수동 연결 해제 ----
+  // ---- 수동 연결 해제 ----
   Future<void> _disconnect() async {
+    // (안전) 스캔 중지
+    try {
+      if (FlutterBluePlus.isScanningNow) {
+        await FlutterBluePlus.stopScan();
+      }
+    } catch (_) {}
+
+    // RSSI 타이머/스트림 종료
     _cancelRssi();
-    await _device?.disconnect();
-    _notifySub?.cancel();
-    _connSub?.cancel();
+
+    // BLE 연결 해제
+    try {
+      await _device?.disconnect();
+    } catch (_) {}
+
+    // notify/connection 구독 종료
+    await _notifySub?.cancel();
+    await _connSub?.cancel();
+    await _scanSub?.cancel();
+
+    // ✅ Foreground 정지
+    try {
+      await FlutterForegroundTask.stopService();
+    } catch (_) {}
+
     setState(() {
       _device = null;
       _connState = BluetoothConnectionState.disconnected;
@@ -426,46 +525,46 @@ class _MainhomeState extends State<Mainhome> {
               ],
             ),
             SizedBox(height: 8.h),
-            Padding(
-              padding: EdgeInsets.symmetric(horizontal: 8.w),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  GestureDetector(
-                    onTap: () {
-                      startService();
-                    },
-                    child: Container(
-                      width: 150.w,
-                      height: 30.h,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: Color(0xFFFFFFFF),
-                        border: Border.all(color: Colors.black),
-                        borderRadius: BorderRadius.circular(10.r),
-                      ),
-                      child: const Text("백그라운드 서비스 시작"),
-                    ),
-                  ),
-                  GestureDetector(
-                    onTap: () {
-                      stopService();
-                    },
-                    child: Container(
-                      width: 150.w,
-                      height: 30.h,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: Color(0xFFFFFFFF),
-                        border: Border.all(color: Colors.black),
-                        borderRadius: BorderRadius.circular(10.r),
-                      ),
-                      child: const Text("백그라운드 서비스 중지"),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+            // Padding(
+            //   padding: EdgeInsets.symmetric(horizontal: 8.w),
+            //   child: Row(
+            //     mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            //     children: [
+            //       GestureDetector(
+            //         onTap: () {
+            //           startService();
+            //         },
+            //         child: Container(
+            //           width: 150.w,
+            //           height: 30.h,
+            //           alignment: Alignment.center,
+            //           decoration: BoxDecoration(
+            //             color: Color(0xFFFFFFFF),
+            //             border: Border.all(color: Colors.black),
+            //             borderRadius: BorderRadius.circular(10.r),
+            //           ),
+            //           child: const Text("백그라운드 서비스 시작"),
+            //         ),
+            //       ),
+            //       GestureDetector(
+            //         onTap: () {
+            //           stopService();
+            //         },
+            //         child: Container(
+            //           width: 150.w,
+            //           height: 30.h,
+            //           alignment: Alignment.center,
+            //           decoration: BoxDecoration(
+            //             color: Color(0xFFFFFFFF),
+            //             border: Border.all(color: Colors.black),
+            //             borderRadius: BorderRadius.circular(10.r),
+            //           ),
+            //           child: const Text("백그라운드 서비스 중지"),
+            //         ),
+            //       ),
+            //     ],
+            //   ),
+            // ),
             SizedBox(height: 8.h),
             Expanded(
               child: Container(
