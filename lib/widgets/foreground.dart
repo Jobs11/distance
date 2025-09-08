@@ -1,3 +1,5 @@
+import 'dart:isolate';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
@@ -5,7 +7,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 void initForegroundTask() {
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
-      channelId: 'bt_service_v4', // ← 새 채널 ID로 변경
+      channelId: 'bt_service_v5', // ← 새 채널 ID로 변경
       channelName: 'Bluetooth Background Service',
       channelDescription: 'ESP32 블루투스 연결 유지 서비스',
       channelImportance: NotificationChannelImportance.HIGH, // 중요
@@ -37,6 +39,29 @@ void stopService() {
   FlutterForegroundTask.stopService();
 }
 
+Future<void> ensureServiceRunning() async {
+  final isRunning = await FlutterForegroundTask.isRunningService;
+  if (!isRunning) {
+    await FlutterForegroundTask.startService(
+      notificationTitle: '앱 실행 중',
+      notificationText: 'ESP32와 블루투스 연결 유지 중...',
+      callback: startCallback,
+    );
+  }
+}
+
+Future<void> updateForegroundNotice({
+  required String title,
+  required String text,
+}) async {
+  if (await FlutterForegroundTask.isRunningService) {
+    await FlutterForegroundTask.updateService(
+      notificationTitle: title,
+      notificationText: text,
+    );
+  }
+}
+
 class RssiForegroundTaskHandler extends TaskHandler {
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
@@ -53,9 +78,9 @@ class RssiForegroundTaskHandler extends TaskHandler {
     // 5초마다 실행됨
     // 여기서 RSSI 가져오기 → 조건에 따라 진동 or 알람
     debugPrint("RSSI 체크 실행됨: $timestamp");
-    FlutterForegroundTask.updateService(
-      notificationText: 'tick ${DateTime.now().toIso8601String()}',
-    );
+    // FlutterForegroundTask.updateService(
+    //   notificationText: 'tick ${DateTime.now().toIso8601String()}',
+    // );
   }
 
   @override

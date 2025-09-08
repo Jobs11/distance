@@ -43,6 +43,8 @@ class _MainhomeState extends State<Mainhome> {
   // 수신 파서 버퍼 (문자열 프레이밍: \n 기준)
   final StringBuffer _rxBuf = StringBuffer();
 
+  String _lastDataText = '-'; //    최근 수신 데이터 텍스트
+
   @override
   void initState() {
     super.initState();
@@ -421,7 +423,23 @@ class _MainhomeState extends State<Mainhome> {
     _rssiTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
       try {
         final rssi = await _device?.readRssi();
-        if (mounted) setState(() => _lastRssi = rssi);
+        if (mounted) {
+          setState(() => _lastRssi = rssi);
+        }
+
+        // 🟦 Foreground 서비스가 실행 중이면 RSSI 값을 전달
+        if (rssi != null) {
+          // 🟦
+          final running = await FlutterForegroundTask.isRunningService; // 🟦
+          if (running) {
+            // 🟦
+            FlutterForegroundTask.sendDataToTask({
+              // 🟦
+              'cmd': 'rssi', // 🟦
+              'value': rssi, // 🟦
+            }); // 🟦
+          } // 🟦
+        } // 🟦
       } catch (_) {}
     });
   }
