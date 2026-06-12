@@ -22,6 +22,7 @@ dependencies:
   flutter_foreground_task: ^9.1.0
   flutter_local_notifications: ^17.2.3
   shared_preferences: ^2.5.3
+  flutter_bluetooth_serial: ^0.4.0
 
 
 dev_dependencies:
