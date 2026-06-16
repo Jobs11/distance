@@ -17,7 +17,7 @@ void initForegroundTask() {
     foregroundTaskOptions: ForegroundTaskOptions(
       allowWakeLock: true,
       allowWifiLock: true,
-      eventAction: ForegroundTaskEventAction.repeat(5000),
+      eventAction: ForegroundTaskEventAction.repeat(1000), // 1초마다
     ),
   );
 }
@@ -35,13 +35,28 @@ void stopService() {
 }
 
 class RssiForegroundTaskHandler extends TaskHandler {
+  String _deviceName = '';
+  bool _alarmActive = false;
+  bool _blinkState = false;
+
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     debugPrint('[FG] onStart');
   }
 
   @override
-  Future<void> onRepeatEvent(DateTime timestamp) async {}
+  Future<void> onRepeatEvent(DateTime timestamp) async {
+    // 알람 활성 중일 때만 1초마다 깜빡임
+    if (_alarmActive) {
+      _blinkState = !_blinkState;
+      FlutterForegroundTask.updateService(
+        notificationTitle: _blinkState ? '🔴 범위 초과!' : '⚠️ 범위 초과!',
+        notificationText: _blinkState
+            ? '$_deviceName 가 범위를 벗어났습니다.'
+            : '앱을 열어 알람을 끄세요.',
+      );
+    }
+  }
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
@@ -51,14 +66,32 @@ class RssiForegroundTaskHandler extends TaskHandler {
   @override
   void onReceiveData(Object data) {
     if (data is Map && data['cmd'] == 'bindDevice') {
-      final name = data['name'] ?? '알 수 없는 기기';
-      // 기기 연결 시 1회만 알림 업데이트
+      _deviceName = data['name'] ?? '알 수 없는 기기';
+      _alarmActive = false;
       FlutterForegroundTask.updateService(
         notificationTitle: 'Smartphone Loss Device',
-        notificationText: '$name 와 연결된 상태',
+        notificationText: '$_deviceName 와 연결된 상태',
       );
     }
-    // rssi 명령은 무시 (알림 갱신 X)
+
+    if (data is Map && data['cmd'] == 'alarmOn') {
+      _deviceName = data['name'] ?? _deviceName;
+      _alarmActive = true;
+      _blinkState = true;
+      FlutterForegroundTask.updateService(
+        notificationTitle: '🔴 범위 초과!',
+        notificationText: '$_deviceName 가 범위를 벗어났습니다.',
+      );
+    }
+
+    if (data is Map && data['cmd'] == 'alarmOff') {
+      _alarmActive = false;
+      _blinkState = false;
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'Smartphone Loss Device',
+        notificationText: '$_deviceName 와 연결된 상태',
+      );
+    }
   }
 }
 

@@ -79,8 +79,6 @@ class _ScanPageState extends State<ScanPage> {
     await FlutterBluePlus.startScan(
       timeout: const Duration(seconds: 30),
       androidScanMode: AndroidScanMode.lowLatency,
-      continuousUpdates: true, // ← 추가
-      continuousDivisor: 1, // ← 추가
     );
 
     await _scanSub?.cancel();
@@ -139,18 +137,25 @@ class _ScanPageState extends State<ScanPage> {
 
   @override
   Widget build(BuildContext context) {
-    final sorted = _results.values.toList()
-      ..sort((a, b) {
-        final aName =
-            a.advertisementData.advName.isNotEmpty ||
-            a.device.platformName.isNotEmpty;
-        final bName =
-            b.advertisementData.advName.isNotEmpty ||
-            b.device.platformName.isNotEmpty;
-        if (aName && !bName) return -1;
-        if (!aName && bName) return 1;
-        return b.rssi.compareTo(a.rssi);
-      });
+    final sorted =
+        _results.values
+            .where(
+              (r) =>
+                  r.advertisementData.advName.isNotEmpty ||
+                  r.device.platformName.isNotEmpty,
+            )
+            .toList()
+          ..sort((a, b) {
+            final aName =
+                a.advertisementData.advName.isNotEmpty ||
+                a.device.platformName.isNotEmpty;
+            final bName =
+                b.advertisementData.advName.isNotEmpty ||
+                b.device.platformName.isNotEmpty;
+            if (aName && !bName) return -1;
+            if (!aName && bName) return 1;
+            return b.rssi.compareTo(a.rssi);
+          });
 
     return Scaffold(
       appBar: AppBar(
@@ -178,29 +183,42 @@ class _ScanPageState extends State<ScanPage> {
       ),
       body: Column(
         children: [
+          // 상태 배너
           Container(
             width: double.infinity,
             color: _isScanning
                 ? Colors.blue.withOpacity(0.08)
                 : Colors.grey.withOpacity(0.05),
             padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-            child: Row(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(
-                  _isScanning ? Icons.bluetooth_searching : Icons.bluetooth,
-                  size: 16,
-                  color: _isScanning ? Colors.blue : Colors.grey,
+                Row(
+                  children: [
+                    Icon(
+                      _isScanning ? Icons.bluetooth_searching : Icons.bluetooth,
+                      size: 16,
+                      color: _isScanning ? Colors.blue : Colors.grey,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _isScanning
+                          ? '스캔 중... (${sorted.length}개 발견)  최대 30초'
+                          : '스캔 완료 (${sorted.length}개 발견)',
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: _isScanning ? Colors.blue : Colors.grey,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 8),
-                Text(
-                  _isScanning
-                      ? '스캔 중... (${sorted.length}개 발견)'
-                      : '스캔 완료 (${sorted.length}개 발견)',
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: _isScanning ? Colors.blue : Colors.grey,
+                if (_isScanning) ...[
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(
+                    backgroundColor: Colors.blue.withOpacity(0.1),
+                    color: Colors.blue,
                   ),
-                ),
+                ],
               ],
             ),
           ),

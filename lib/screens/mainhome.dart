@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 import 'package:distance/screens/scan_page.dart';
 import 'package:distance/widgets/foreground.dart';
 import 'package:distance/widgets/rssiguard.dart';
@@ -33,12 +32,13 @@ class Mainhome extends StatefulWidget {
 }
 
 class _MainhomeState extends State<Mainhome>
-    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final Guid nusService = Guid("0000dfb0-0000-1000-8000-00805f9b34fb");
   final Guid nusRxChar = Guid(
     "0000dfb1-0000-1000-8000-00805f9b34fb",
-  ); // notify (ACK)
-  final Guid nusTxChar = Guid("0000dfb1-0000-1000-8000-00805f9b34fb"); // write
+  ); // notify + write
+  final Guid nusTxChar = Guid("0000dfb1-0000-1000-8000-00805f9b34fb");
+
   BluetoothDevice? _device;
   BluetoothCharacteristic? _txChar;
   BluetoothConnectionState _connState = BluetoothConnectionState.disconnected;
@@ -47,7 +47,6 @@ class _MainhomeState extends State<Mainhome>
   String _lastRecv = '-';
   final List<String> _recvLog = [];
   int? _lastRssi;
-  int? _batteryMv;
 
   StreamSubscription<BluetoothConnectionState>? _connSub;
   StreamSubscription<List<int>>? _notifySub;
@@ -60,15 +59,15 @@ class _MainhomeState extends State<Mainhome>
   bool _restoring = false;
   bool _didRestoreOnce = false;
   bool _showSettings = false;
+  bool _isBackground = false; // 백그라운드 여부
 
   final StringBuffer _rxBuf = StringBuffer();
 
-  // 거리 설정
-  static const double _txPower = -56.0; // 1m 기준 RSSI
-  static const double _pathN = 2.8; // 환경 계수 (실내 기준)
-  // 가까움(5m) / 멀어짐(10m) 선택
-  bool _isNearMode = true; // true=가까움(5m), false=멀어짐(10m)
-  double get _alertDist => _isNearMode ? 5.0 : 10.0;
+  // RSSI 임계값
+  static const double _rssiNear = -85.0; // 가까운 범위
+  static const double _rssiFar = -89.0; // 넓은 범위
+  bool _isNearMode = true; // true=가까운 범위(-80), false=넓은 범위(-88)
+  double get _alertRssi => _isNearMode ? _rssiNear : _rssiFar;
 
   // 진동 감지
   int _consecutiveOver = 0;
@@ -87,6 +86,10 @@ class _MainhomeState extends State<Mainhome>
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
 
+  // 알람 깜빡임 애니메이션
+  late AnimationController _alarmCtrl;
+  late Animation<double> _alarmAnim;
+
   @override
   void initState() {
     super.initState();
@@ -102,6 +105,15 @@ class _MainhomeState extends State<Mainhome>
       end: 1.05,
     ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
 
+    _alarmCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    );
+    _alarmAnim = Tween<double>(
+      begin: 0.0,
+      end: 0.3,
+    ).animate(CurvedAnimation(parent: _alarmCtrl, curve: Curves.easeInOut));
+
     _loadSettings();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _restoreConnectIntent();
@@ -112,6 +124,7 @@ class _MainhomeState extends State<Mainhome>
   @override
   void dispose() {
     _pulseCtrl.dispose();
+    _alarmCtrl.dispose();
     _alarmTimer?.cancel();
     _audioPlayer.dispose();
     Vibration.cancel();
@@ -124,7 +137,13 @@ class _MainhomeState extends State<Mainhome>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _restoreConnectIntent();
+    if (state == AppLifecycleState.resumed) {
+      _isBackground = false;
+      _restoreConnectIntent();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      _isBackground = true;
+    }
   }
 
   Future<void> _requestBatteryOpt() async {
@@ -148,21 +167,10 @@ class _MainhomeState extends State<Mainhome>
     await p.setInt('alarm_mode', _alarmMode);
   }
 
-  // 거리 → RSSI 변환
-  double _distToRssi(double dist) {
-    if (dist <= 0) return _txPower;
-    return _txPower - 10.0 * _pathN * (log(dist) / log(10));
-  }
-
-  // RSSI → 거리 변환
-  double _rssiToDist(int rssi) {
-    return pow(10.0, (_txPower - rssi) / (10.0 * _pathN)).toDouble();
-  }
-
   // ── 상태 판단 ─────────────────────────────────────────────
   bool get _isNear {
     if (!_connected || _lastRssi == null) return true;
-    return _rssiToDist(_lastRssi!) < _alertDist;
+    return _lastRssi! > _alertRssi;
   }
 
   // ── 권한 ──────────────────────────────────────────────────
@@ -285,7 +293,6 @@ class _MainhomeState extends State<Mainhome>
       _status = '연결 중…';
       _lastRecv = '-';
       _lastRssi = null;
-      _batteryMv = null;
       _rxBuf.clear();
     });
 
@@ -350,7 +357,12 @@ class _MainhomeState extends State<Mainhome>
       await prefs.setString('lastDeviceName', name);
       await prefs.setBool('wantConnect', true);
     } catch (e) {
-      setState(() => _status = '연결 실패: $e');
+      final errStr = e.toString();
+      String msg = '연결 실패';
+      if (errStr.contains('133') || errStr.contains('ANDROID_SPECIFIC_ERROR')) {
+        msg = '연결 중 오류 발생, 다시 시도해주세요.';
+      }
+      setState(() => _status = msg);
       debugPrint('연결 실패: $e');
     }
   }
@@ -374,9 +386,7 @@ class _MainhomeState extends State<Mainhome>
       } catch (_) {}
       try {
         tx = svc.characteristics.firstWhere(
-          (c) =>
-              c.uuid == nusTxChar &&
-              (c.properties.write || c.properties.writeWithoutResponse),
+          (c) => c.uuid == nusTxChar && c.properties.write,
         );
       } catch (_) {}
     }
@@ -390,9 +400,7 @@ class _MainhomeState extends State<Mainhome>
         });
         if (cand.isNotEmpty) {
           rx = cand.first;
-          final writables = s.characteristics.where(
-            (c) => c.properties.write || c.properties.writeWithoutResponse,
-          );
+          final writables = s.characteristics.where((c) => c.properties.write);
           if (writables.isNotEmpty) tx = writables.first;
           break;
         }
@@ -412,7 +420,7 @@ class _MainhomeState extends State<Mainhome>
       onError: (e) => debugPrint('RX error: $e'),
     );
 
-    debugPrint('[BLE] RX notify 구독 완료: ${rx.uuid}');
+    setState(() => _status = '연결됨');
   }
 
   // ── 보드로 값 전송 ────────────────────────────────────────
@@ -431,10 +439,9 @@ class _MainhomeState extends State<Mainhome>
   void _onBytes(List<int> data) {
     if (data.isEmpty) return;
 
-    // null 바이트 및 쓰레기 값 제거 (32 미만이고 \r\n 아닌 것)
+    // null 바이트 및 쓰레기 값 제거 (\r \n 제외한 32 미만 제거)
     final clean = data.where((b) => b >= 32 || b == 13 || b == 10).toList();
-
-    debugPrint('[RX RAW] $data');
+    if (clean.isEmpty) return;
 
     String txt = '';
     try {
@@ -443,15 +450,12 @@ class _MainhomeState extends State<Mainhome>
       txt = String.fromCharCodes(clean);
     }
 
-    debugPrint('[RX TXT] $txt');
-
     _rxBuf.write(txt.replaceAll('\r', '\n'));
 
     while (true) {
       final s = _rxBuf.toString();
       final idx = s.indexOf('\n');
-      if (idx < 0) return;
-
+      if (idx < 0) break;
       final line = s.substring(0, idx).trim();
       _rxBuf.clear();
       if (idx + 1 < s.length) _rxBuf.write(s.substring(idx + 1));
@@ -460,29 +464,11 @@ class _MainhomeState extends State<Mainhome>
   }
 
   void _pushValue(String val) {
-    debugPrint('[RX LINE] $val');
-
-    int? parsedBatteryMv;
-
-    if (val.startsWith('BAT:')) {
-      parsedBatteryMv = int.tryParse(val.substring(4).trim());
-      debugPrint('[BAT] ${parsedBatteryMv ?? '-'} mV');
-    } else if (val.startsWith('ACK:')) {
-      debugPrint('[ACK] $val');
-    }
-
     if (mounted) {
       setState(() {
-        if (parsedBatteryMv != null) {
-          _batteryMv = parsedBatteryMv;
-        }
-
         _lastRecv = val;
         _recvLog.insert(0, val);
-
-        if (_recvLog.length > 100) {
-          _recvLog.removeLast();
-        }
+        if (_recvLog.length > 100) _recvLog.removeLast();
       });
     }
   }
@@ -505,13 +491,17 @@ class _MainhomeState extends State<Mainhome>
         final rssi = await _device?.readRssi();
         if (rssi == null) return;
 
-        final dist = _rssiToDist(rssi);
-        final isOver = dist >= _alertDist; // 설정 거리 이상 멀어짐
+        final isOver = rssi <= _alertRssi; // 임계값 이하면 알람
 
         if (mounted) setState(() => _lastRssi = rssi);
 
-        // 상태에 따라 0 또는 1 계속 전송
-        await _sendValue(isOver ? '1' : '0');
+        // 알람 활성 중이면 무조건 1 전송
+        // 알람 꺼진 상태에서만 isOver 판단
+        if (_alarmActive) {
+          await _sendValue('1');
+        } else {
+          await _sendValue(isOver ? '1' : '0');
+        }
 
         // 멀어진 경우 진동 (연속 3회)
         if (isOver) {
@@ -523,11 +513,6 @@ class _MainhomeState extends State<Mainhome>
         if (_consecutiveOver >= _triggerConsec) {
           await _maybeVibrate();
           _consecutiveOver = 0;
-        }
-
-        final running = await FlutterForegroundTask.isRunningService;
-        if (running) {
-          FlutterForegroundTask.sendDataToTask({'cmd': 'rssi', 'value': rssi});
         }
       } catch (_) {}
     });
@@ -542,6 +527,16 @@ class _MainhomeState extends State<Mainhome>
 
   void _startAlarm() {
     setState(() => _alarmActive = true);
+    _alarmCtrl.repeat(reverse: true);
+
+    // 백그라운드일 때만 포그라운드 알림 갱신
+    if (_isBackground) {
+      FlutterForegroundTask.sendDataToTask({
+        'cmd': 'alarmOn',
+        'name': _deviceName,
+      });
+    }
+
     _alarmTimer?.cancel();
     _alarmTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
       if (!_alarmActive) {
@@ -577,9 +572,18 @@ class _MainhomeState extends State<Mainhome>
   void _stopAlarm() {
     _alarmTimer?.cancel();
     _alarmTimer = null;
+    _alarmCtrl.stop();
+    _alarmCtrl.reset();
     Vibration.cancel();
     _audioPlayer.stop();
     setState(() => _alarmActive = false);
+    _sendValue('0');
+
+    // 포그라운드 알림 원래대로
+    FlutterForegroundTask.sendDataToTask({
+      'cmd': 'alarmOff',
+      'name': _deviceName,
+    });
   }
 
   void _cancelRssi() {
@@ -610,7 +614,6 @@ class _MainhomeState extends State<Mainhome>
       _status = '기기를 연결해주세요';
       _lastRecv = '-';
       _lastRssi = null;
-      _batteryMv = null;
       _rxBuf.clear();
     });
   }
@@ -627,7 +630,8 @@ class _MainhomeState extends State<Mainhome>
         await _afterConnected();
         _reconnectDelay = const Duration(seconds: 1);
         return;
-      } catch (_) {
+      } catch (e) {
+        debugPrint('재연결 실패: $e');
         await Future.delayed(_reconnectDelay);
         final next = _reconnectDelay.inSeconds * 2;
         _reconnectDelay = Duration(
@@ -644,13 +648,19 @@ class _MainhomeState extends State<Mainhome>
       );
       await _device?.requestMtu(185);
     } catch (_) {}
+
     if (_device != null && _connState == BluetoothConnectionState.connected) {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('lastDeviceId', _device!.remoteId.str);
       await prefs.setBool('wantConnect', true);
     }
+
+    // 재연결 후 서비스/캐릭터리스틱 재구독
+    await _discoverAndSubscribe();
     _watchConnection();
     _startRssi();
+
+    if (mounted) setState(() => _status = '재연결됨');
   }
 
   void _watchConnection() {
@@ -675,10 +685,7 @@ class _MainhomeState extends State<Mainhome>
   String get _zoneLabel {
     if (!_connected) return '연결 안됨';
     if (_lastRssi == null) return '측정 중...';
-    final dist = _rssiToDist(_lastRssi!);
-    return _isNear
-        ? '범위 안 (${dist.toStringAsFixed(1)}m)'
-        : '범위 초과 (${dist.toStringAsFixed(1)}m)';
+    return _isNear ? '범위 안' : '범위 초과';
   }
 
   String get _deviceName {
@@ -703,37 +710,42 @@ class _MainhomeState extends State<Mainhome>
           FlutterForegroundTask.minimizeApp();
         }
       },
-      child: Scaffold(
-        backgroundColor: kBg,
-        body: SafeArea(
-          bottom: false,
-          child: SingleChildScrollView(
-            padding: EdgeInsets.fromLTRB(
-              20.w,
-              16.h,
-              20.w,
-              MediaQuery.of(context).padding.bottom + 16.h,
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildHeader(),
-                SizedBox(height: 24.h),
-                // 알람 활성화 시 경고 배너
-                if (_alarmActive) _buildAlarmBanner(),
-                _buildDistanceGauge(),
-                SizedBox(height: 20.h),
-                _buildStatusCard(),
-                SizedBox(height: 16.h),
-                _buildSettingsCard(),
-                SizedBox(height: 16.h),
-                _buildRecvCard(),
-                SizedBox(height: 24.h),
-              ],
+      child: AnimatedBuilder(
+        animation: _alarmAnim,
+        builder: (context, child) => Scaffold(
+          backgroundColor: _alarmActive
+              ? Color.lerp(Colors.white, kRed, _alarmAnim.value)!
+              : kBg,
+          body: SafeArea(
+            bottom: false,
+            child: SingleChildScrollView(
+              padding: EdgeInsets.fromLTRB(
+                20.w,
+                16.h,
+                20.w,
+                MediaQuery.of(context).padding.bottom + 16.h,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildHeader(),
+                  SizedBox(height: 24.h),
+                  // 알람 활성화 시 경고 배너
+                  if (_alarmActive) _buildAlarmBanner(),
+                  _buildDistanceGauge(),
+                  SizedBox(height: 20.h),
+                  _buildStatusCard(),
+                  SizedBox(height: 16.h),
+                  _buildSettingsCard(),
+                  SizedBox(height: 16.h),
+                  _buildRecvCard(),
+                  SizedBox(height: 24.h),
+                ],
+              ),
             ),
           ),
-        ),
-      ),
+        ), // AnimatedBuilder
+      ), // PopScope
     );
   }
 
@@ -794,6 +806,24 @@ class _MainhomeState extends State<Mainhome>
                     ),
                   ),
                 ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            // 테스트 버튼 (임시)
+            GestureDetector(
+              onTap: () => _alarmActive ? _stopAlarm() : _startAlarm(),
+              child: Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: _alarmActive ? kRed : kBeige,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(
+                  _alarmActive ? Icons.alarm_off : Icons.alarm,
+                  size: 20,
+                  color: _alarmActive ? Colors.white : kBrown,
+                ),
               ),
             ),
             const SizedBox(width: 8),
@@ -1355,18 +1385,10 @@ class _MainhomeState extends State<Mainhome>
                   ),
                 ),
                 const Spacer(),
-                Text(
-                  _batteryMv == null ? '배터리: -' : '배터리: ${_batteryMv}mV',
-                  style: TextStyle(fontSize: 12.sp, color: kGrey),
-                ),
-                const SizedBox(width: 8),
                 if (_lastRecv != '-')
-                  Flexible(
-                    child: Text(
-                      '최근: $_lastRecv',
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 12.sp, color: kGrey),
-                    ),
+                  Text(
+                    '최근: $_lastRecv',
+                    style: TextStyle(fontSize: 12.sp, color: kGrey),
                   ),
                 const SizedBox(width: 8),
                 GestureDetector(
