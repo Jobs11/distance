@@ -11,6 +11,8 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vibration/vibration.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 // ── 색상 토큰 ─────────────────────────────────────────────────
 const kBg = Color(0xFFFAF7F2);
@@ -32,19 +34,20 @@ class Mainhome extends StatefulWidget {
 
 class _MainhomeState extends State<Mainhome>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-  final Guid nusService = Guid("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
-  final Guid nusRxChar = Guid("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
-  final Guid nusTxChar = Guid("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
-
+  final Guid nusService = Guid("0000dfb0-0000-1000-8000-00805f9b34fb");
+  final Guid nusRxChar = Guid(
+    "0000dfb1-0000-1000-8000-00805f9b34fb",
+  ); // notify (ACK)
+  final Guid nusTxChar = Guid("0000dfb1-0000-1000-8000-00805f9b34fb"); // write
   BluetoothDevice? _device;
   BluetoothCharacteristic? _txChar;
   BluetoothConnectionState _connState = BluetoothConnectionState.disconnected;
 
   String _status = '기기를 연결해주세요';
   String _lastRecv = '-';
-  final List<_LogEntry> _log = [];
+  final List<String> _recvLog = [];
   int? _lastRssi;
-  double _estimatedDist = 0.0;
+  int? _batteryMv;
 
   StreamSubscription<BluetoothConnectionState>? _connSub;
   StreamSubscription<List<int>>? _notifySub;
@@ -56,17 +59,29 @@ class _MainhomeState extends State<Mainhome>
 
   bool _restoring = false;
   bool _didRestoreOnce = false;
-  bool _showLog = false;
   bool _showSettings = false;
 
   final StringBuffer _rxBuf = StringBuffer();
-  final TextEditingController _txController = TextEditingController();
-  bool _isSending = false;
 
-  // 거리 설정값
-  double _txPower = -59.0;
-  double _pathN = 2.0;
-  double _maxDist = 3.0;
+  // 거리 설정
+  static const double _txPower = -56.0; // 1m 기준 RSSI
+  static const double _pathN = 2.8; // 환경 계수 (실내 기준)
+  // 가까움(5m) / 멀어짐(10m) 선택
+  bool _isNearMode = true; // true=가까움(5m), false=멀어짐(10m)
+  double get _alertDist => _isNearMode ? 5.0 : 10.0;
+
+  // 진동 감지
+  int _consecutiveOver = 0;
+  static const int _triggerConsec = 3;
+  static const int _cooldownMs = 5000;
+  DateTime _lastVibe = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // 알람 상태
+  bool _alarmActive = false;
+  Timer? _alarmTimer;
+
+  // 알람 모드 (0=진동, 1=소리, 2=진동&소리)
+  int _alarmMode = 0;
 
   // 펄스 애니메이션
   late AnimationController _pulseCtrl;
@@ -97,11 +112,12 @@ class _MainhomeState extends State<Mainhome>
   @override
   void dispose() {
     _pulseCtrl.dispose();
-    _txController.dispose();
+    _alarmTimer?.cancel();
+    _audioPlayer.dispose();
+    Vibration.cancel();
     _cancelRssi();
     _notifySub?.cancel();
     _connSub?.cancel();
-    _device?.disconnect();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -121,28 +137,32 @@ class _MainhomeState extends State<Mainhome>
   Future<void> _loadSettings() async {
     final p = await SharedPreferences.getInstance();
     setState(() {
-      _txPower = p.getDouble('rssi_txPower') ?? -59.0;
-      _pathN = p.getDouble('rssi_pathN') ?? 2.0;
-      _maxDist = p.getDouble('rssi_maxDist') ?? 3.0;
+      _isNearMode = p.getBool('is_near_mode') ?? true;
+      _alarmMode = p.getInt('alarm_mode') ?? 0;
     });
   }
 
   Future<void> _saveSettings() async {
     final p = await SharedPreferences.getInstance();
-    await p.setDouble('rssi_txPower', _txPower);
-    await p.setDouble('rssi_pathN', _pathN);
-    await p.setDouble('rssi_maxDist', _maxDist);
+    await p.setBool('is_near_mode', _isNearMode);
+    await p.setInt('alarm_mode', _alarmMode);
   }
 
-  // ── 거리 계산 ─────────────────────────────────────────────
-  double _calcDist(int rssi) {
-    if (rssi == 0) return 0.0;
+  // 거리 → RSSI 변환
+  double _distToRssi(double dist) {
+    if (dist <= 0) return _txPower;
+    return _txPower - 10.0 * _pathN * (log(dist) / log(10));
+  }
+
+  // RSSI → 거리 변환
+  double _rssiToDist(int rssi) {
     return pow(10.0, (_txPower - rssi) / (10.0 * _pathN)).toDouble();
   }
 
-  double _distToRssi(double dist) {
-    if (dist <= 0) return _txPower;
-    return _txPower - 10.0 * _pathN * log(dist) / ln10;
+  // ── 상태 판단 ─────────────────────────────────────────────
+  bool get _isNear {
+    if (!_connected || _lastRssi == null) return true;
+    return _rssiToDist(_lastRssi!) < _alertDist;
   }
 
   // ── 권한 ──────────────────────────────────────────────────
@@ -174,57 +194,73 @@ class _MainhomeState extends State<Mainhome>
   // ── 자동 재연결 ───────────────────────────────────────────
   Future<void> _restoreConnectIntent() async {
     if (_restoring) return;
+    if (_connState == BluetoothConnectionState.connected) return;
     _restoring = true;
+
     try {
-      if (_connState == BluetoothConnectionState.connected) return;
       if (!await _ensurePermissions()) return;
       if (!await _ensureBluetoothOn()) return;
 
       final prefs = await SharedPreferences.getInstance();
       final want = prefs.getBool('wantConnect') ?? false;
       final lastId = prefs.getString('lastDeviceId');
+      final lastName = prefs.getString('lastDeviceName') ?? '';
 
       if (!want || lastId == null || lastId.isEmpty) return;
 
       _userWantsConnect = true;
-      setState(() => _status = '마지막 기기에 재연결 중...');
+      setState(() => _status = '$lastName 재연결 중...');
 
       try {
         final dev = BluetoothDevice.fromId(lastId);
 
-        // 연결 상태 확인
+        // 이미 연결된 상태면 바로 구독만
         final state = await dev.connectionState.first;
         if (state == BluetoothConnectionState.connected) {
           _device = dev;
-          setState(() => _connState = BluetoothConnectionState.connected);
+          setState(() {
+            _connState = BluetoothConnectionState.connected;
+            _status = '$lastName 연결됨';
+          });
           await _discoverAndSubscribe();
           _startRssi();
           _watchConnection();
-          setState(() => _status = '재연결됨');
-          _didRestoreOnce = true;
           return;
         }
 
-        // 새로 연결
-        await dev.connect(
-          autoConnect: false,
-          timeout: const Duration(seconds: 10),
+        // 스캔으로 기기 찾아서 연결 (advertising interval 대응)
+        setState(() => _status = '$lastName 스캔 중...');
+
+        bool found = false;
+        await FlutterBluePlus.startScan(
+          timeout: const Duration(seconds: 30),
+          androidScanMode: AndroidScanMode.lowLatency,
         );
-        _device = dev;
 
-        try {
-          await dev.requestMtu(512);
-        } catch (_) {}
+        await for (final results in FlutterBluePlus.scanResults) {
+          for (final r in results) {
+            if (r.device.remoteId.str == lastId) {
+              found = true;
+              await FlutterBluePlus.stopScan();
+              await _onDeviceFound(r.device, lastName);
 
-        setState(() {
-          _connState = BluetoothConnectionState.connected;
-          _status = '재연결됨';
-        });
+              // 포그라운드 서비스 시작
+              try {
+                await FlutterForegroundTask.startService(
+                  notificationTitle: 'Smartphone Loss Device',
+                  notificationText: '$lastName 와 연결된 상태',
+                  callback: startCallback,
+                );
+              } catch (_) {}
+              return;
+            }
+          }
+          if (found) break;
+        }
 
-        await _discoverAndSubscribe();
-        _startRssi();
-        _watchConnection();
-        _didRestoreOnce = true;
+        if (!found) {
+          setState(() => _status = '기기를 찾지 못했습니다. 수동으로 연결해주세요.');
+        }
       } catch (e) {
         debugPrint('자동 재연결 실패: $e');
         setState(() => _status = '기기를 연결해주세요');
@@ -249,8 +285,8 @@ class _MainhomeState extends State<Mainhome>
       _status = '연결 중…';
       _lastRecv = '-';
       _lastRssi = null;
+      _batteryMv = null;
       _rxBuf.clear();
-      _log.clear();
     });
 
     _userWantsConnect = true;
@@ -311,6 +347,7 @@ class _MainhomeState extends State<Mainhome>
       // 연결 성공 시 저장
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('lastDeviceId', dev.remoteId.str);
+      await prefs.setString('lastDeviceName', name);
       await prefs.setBool('wantConnect', true);
     } catch (e) {
       setState(() => _status = '연결 실패: $e');
@@ -337,7 +374,9 @@ class _MainhomeState extends State<Mainhome>
       } catch (_) {}
       try {
         tx = svc.characteristics.firstWhere(
-          (c) => c.uuid == nusTxChar && c.properties.write,
+          (c) =>
+              c.uuid == nusTxChar &&
+              (c.properties.write || c.properties.writeWithoutResponse),
         );
       } catch (_) {}
     }
@@ -351,7 +390,9 @@ class _MainhomeState extends State<Mainhome>
         });
         if (cand.isNotEmpty) {
           rx = cand.first;
-          final writables = s.characteristics.where((c) => c.properties.write);
+          final writables = s.characteristics.where(
+            (c) => c.properties.write || c.properties.writeWithoutResponse,
+          );
           if (writables.isNotEmpty) tx = writables.first;
           break;
         }
@@ -370,82 +411,80 @@ class _MainhomeState extends State<Mainhome>
       (bytes) => _onBytes(bytes),
       onError: (e) => debugPrint('RX error: $e'),
     );
+
+    debugPrint('[BLE] RX notify 구독 완료: ${rx.uuid}');
+  }
+
+  // ── 보드로 값 전송 ────────────────────────────────────────
+  Future<void> _sendValue(String val) async {
+    if (_txChar == null) return;
+    try {
+      final bytes = utf8.encode('$val\n');
+      final canWrite = _txChar!.properties.writeWithoutResponse;
+      await _txChar!.write(bytes, withoutResponse: canWrite);
+      debugPrint('[TX] 전송: $val');
+    } catch (e) {
+      debugPrint('[TX] 전송 실패: $e');
+    }
   }
 
   void _onBytes(List<int> data) {
     if (data.isEmpty) return;
+
+    // null 바이트 및 쓰레기 값 제거 (32 미만이고 \r\n 아닌 것)
+    final clean = data.where((b) => b >= 32 || b == 13 || b == 10).toList();
+
+    debugPrint('[RX RAW] $data');
+
     String txt = '';
     try {
-      txt = utf8.decode(data);
-    } catch (_) {}
+      txt = utf8.decode(clean);
+    } catch (_) {
+      txt = String.fromCharCodes(clean);
+    }
 
-    if (txt.contains('\n') || txt.contains('\r')) {
-      _rxBuf.write(txt);
-      while (true) {
-        final s = _rxBuf.toString();
-        final idxN = s.indexOf('\n');
-        final idxR = s.indexOf('\r');
-        final cut = (idxN >= 0 && idxR >= 0)
-            ? (idxN < idxR ? idxN : idxR)
-            : (idxN >= 0 ? idxN : idxR);
-        if (cut < 0) break;
-        final line = s.substring(0, cut).trim();
-        _rxBuf.clear();
-        if (cut + 1 < s.length) _rxBuf.write(s.substring(cut + 1));
-        _parseLine(line);
-      }
-      return;
-    }
-    if (txt.isNotEmpty && RegExp(r'^[0-9\s,;]+$').hasMatch(txt)) {
-      _parseLine(txt.trim());
-      return;
-    }
-    if (data.length == 1) {
-      _pushValue(data.first.toString());
-      return;
-    }
-    for (final b in data) _pushValue(b.toString());
-  }
+    debugPrint('[RX TXT] $txt');
 
-  void _parseLine(String line) {
-    if (line.isEmpty) return;
-    final tokens = line.split(RegExp(r'[\s,;]+')).where((t) => t.isNotEmpty);
-    for (final t in tokens) _pushValue(t);
+    _rxBuf.write(txt.replaceAll('\r', '\n'));
+
+    while (true) {
+      final s = _rxBuf.toString();
+      final idx = s.indexOf('\n');
+      if (idx < 0) return;
+
+      final line = s.substring(0, idx).trim();
+      _rxBuf.clear();
+      if (idx + 1 < s.length) _rxBuf.write(s.substring(idx + 1));
+      if (line.isNotEmpty) _pushValue(line);
+    }
   }
 
   void _pushValue(String val) {
+    debugPrint('[RX LINE] $val');
+
+    int? parsedBatteryMv;
+
+    if (val.startsWith('BAT:')) {
+      parsedBatteryMv = int.tryParse(val.substring(4).trim());
+      debugPrint('[BAT] ${parsedBatteryMv ?? '-'} mV');
+    } else if (val.startsWith('ACK:')) {
+      debugPrint('[ACK] $val');
+    }
+
     if (mounted) {
       setState(() {
+        if (parsedBatteryMv != null) {
+          _batteryMv = parsedBatteryMv;
+        }
+
         _lastRecv = val;
-        _addLog(_LogEntry(direction: _Dir.rx, text: val));
+        _recvLog.insert(0, val);
+
+        if (_recvLog.length > 100) {
+          _recvLog.removeLast();
+        }
       });
     }
-  }
-
-  Future<void> _sendData() async {
-    final text = _txController.text.trim();
-    if (text.isEmpty) return;
-    if (_txChar == null || _connState != BluetoothConnectionState.connected) {
-      _showSnack('연결 상태가 아닙니다.');
-      return;
-    }
-    setState(() => _isSending = true);
-    try {
-      final bytes = utf8.encode('$text\n');
-      final canWrite = _txChar!.properties.writeWithoutResponse;
-      await _txChar!.write(bytes, withoutResponse: canWrite);
-      _addLog(_LogEntry(direction: _Dir.tx, text: text));
-      _txController.clear();
-    } catch (e) {
-      _showSnack('전송 실패: $e');
-    } finally {
-      if (mounted) setState(() => _isSending = false);
-    }
-  }
-
-  void _addLog(_LogEntry entry) {
-    _log.insert(0, entry);
-    if (_log.length > 200) _log.removeLast();
   }
 
   void _showSnack(String msg) {
@@ -461,26 +500,86 @@ class _MainhomeState extends State<Mainhome>
 
   void _startRssi() {
     _cancelRssi();
-    _rssiTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+    _rssiTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
       try {
         final rssi = await _device?.readRssi();
-        if (mounted && rssi != null) {
-          setState(() {
-            _lastRssi = rssi;
-            _estimatedDist = _calcDist(rssi);
-          });
+        if (rssi == null) return;
+
+        final dist = _rssiToDist(rssi);
+        final isOver = dist >= _alertDist; // 설정 거리 이상 멀어짐
+
+        if (mounted) setState(() => _lastRssi = rssi);
+
+        // 상태에 따라 0 또는 1 계속 전송
+        await _sendValue(isOver ? '1' : '0');
+
+        // 멀어진 경우 진동 (연속 3회)
+        if (isOver) {
+          _consecutiveOver++;
+        } else {
+          _consecutiveOver = 0;
         }
-        if (rssi != null) {
-          final running = await FlutterForegroundTask.isRunningService;
-          if (running) {
-            FlutterForegroundTask.sendDataToTask({
-              'cmd': 'rssi',
-              'value': rssi,
-            });
-          }
+
+        if (_consecutiveOver >= _triggerConsec) {
+          await _maybeVibrate();
+          _consecutiveOver = 0;
+        }
+
+        final running = await FlutterForegroundTask.isRunningService;
+        if (running) {
+          FlutterForegroundTask.sendDataToTask({'cmd': 'rssi', 'value': rssi});
         }
       } catch (_) {}
     });
+  }
+
+  final AudioPlayer _audioPlayer = AudioPlayer();
+
+  Future<void> _maybeVibrate() async {
+    if (_alarmActive) return;
+    _startAlarm();
+  }
+
+  void _startAlarm() {
+    setState(() => _alarmActive = true);
+    _alarmTimer?.cancel();
+    _alarmTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (!_alarmActive) {
+        _alarmTimer?.cancel();
+        return;
+      }
+      // 진동
+      if (_alarmMode == 0 || _alarmMode == 2) {
+        if (await Vibration.hasVibrator() ?? false) {
+          await Vibration.vibrate(pattern: [0, 300, 100, 300]);
+        }
+      }
+      // 소리
+      if (_alarmMode == 1 || _alarmMode == 2) {
+        await _audioPlayer.play(AssetSource('sounds/alarm1.wav'));
+      }
+    });
+    // 첫 알람 즉시 실행
+    _triggerAlarm();
+  }
+
+  Future<void> _triggerAlarm() async {
+    if (_alarmMode == 0 || _alarmMode == 2) {
+      if (await Vibration.hasVibrator() ?? false) {
+        await Vibration.vibrate(pattern: [0, 300, 100, 300]);
+      }
+    }
+    if (_alarmMode == 1 || _alarmMode == 2) {
+      await _audioPlayer.play(AssetSource('sounds/alarm1.wav'));
+    }
+  }
+
+  void _stopAlarm() {
+    _alarmTimer?.cancel();
+    _alarmTimer = null;
+    Vibration.cancel();
+    _audioPlayer.stop();
+    setState(() => _alarmActive = false);
   }
 
   void _cancelRssi() {
@@ -491,7 +590,8 @@ class _MainhomeState extends State<Mainhome>
   Future<void> _disconnect() async {
     _userWantsConnect = false;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('wantConnect', false);
+    // 기기 정보 + wantConnect 유지 → 앱 재시작 시 자동 재연결
+    await prefs.setBool('wantConnect', true);
 
     _cancelRssi();
     try {
@@ -510,9 +610,8 @@ class _MainhomeState extends State<Mainhome>
       _status = '기기를 연결해주세요';
       _lastRecv = '-';
       _lastRssi = null;
-      _estimatedDist = 0.0;
+      _batteryMv = null;
       _rxBuf.clear();
-      _log.clear();
     });
   }
 
@@ -570,18 +669,16 @@ class _MainhomeState extends State<Mainhome>
 
   Color get _zoneColor {
     if (!_connected || _lastRssi == null) return kGrey;
-    final threshold = _distToRssi(_maxDist);
-    if (_lastRssi! > threshold) return kGreen;
-    if (_lastRssi! > threshold - 10) return kOrange;
-    return kRed;
+    return _isNear ? kGreen : kRed;
   }
 
   String get _zoneLabel {
     if (!_connected) return '연결 안됨';
     if (_lastRssi == null) return '측정 중...';
-    final threshold = _distToRssi(_maxDist);
-    if (_lastRssi! > threshold) return '범위 안';
-    return '범위 초과';
+    final dist = _rssiToDist(_lastRssi!);
+    return _isNear
+        ? '범위 안 (${dist.toStringAsFixed(1)}m)'
+        : '범위 초과 (${dist.toStringAsFixed(1)}m)';
   }
 
   String get _deviceName {
@@ -596,28 +693,41 @@ class _MainhomeState extends State<Mainhome>
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
-      onPopInvoked: (didPop) {
-        if (!didPop) FlutterForegroundTask.minimizeApp();
+      onPopInvoked: (didPop) async {
+        if (!didPop) {
+          // 뒤로가기 = 포그라운드로 전환, 연결 의지 유지
+          if (_connected) {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setBool('wantConnect', true);
+          }
+          FlutterForegroundTask.minimizeApp();
+        }
       },
       child: Scaffold(
         backgroundColor: kBg,
         body: SafeArea(
+          bottom: false,
           child: SingleChildScrollView(
-            padding: EdgeInsets.symmetric(horizontal: 20.w, vertical: 16.h),
+            padding: EdgeInsets.fromLTRB(
+              20.w,
+              16.h,
+              20.w,
+              MediaQuery.of(context).padding.bottom + 16.h,
+            ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 _buildHeader(),
                 SizedBox(height: 24.h),
+                // 알람 활성화 시 경고 배너
+                if (_alarmActive) _buildAlarmBanner(),
                 _buildDistanceGauge(),
                 SizedBox(height: 20.h),
                 _buildStatusCard(),
                 SizedBox(height: 16.h),
                 _buildSettingsCard(),
                 SizedBox(height: 16.h),
-                _buildSendCard(),
-                SizedBox(height: 16.h),
-                _buildLogCard(),
+                _buildRecvCard(),
                 SizedBox(height: 24.h),
               ],
             ),
@@ -687,6 +797,24 @@ class _MainhomeState extends State<Mainhome>
               ),
             ),
             const SizedBox(width: 8),
+            // 알람 설정 버튼
+            GestureDetector(
+              onTap: _showAlarmSettings,
+              child: Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: kBeige,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(
+                  Icons.notifications_outlined,
+                  size: 20,
+                  color: kBrown,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
             // 연결/해제 버튼
             GestureDetector(
               onTap: _connected ? _disconnect : _scanAndConnect,
@@ -714,12 +842,6 @@ class _MainhomeState extends State<Mainhome>
 
   // ── 원형 거리 게이지 ──────────────────────────────────────
   Widget _buildDistanceGauge() {
-    final ratio = _connected && _lastRssi != null
-        ? (_estimatedDist / _maxDist).clamp(0.0, 1.2)
-        : 0.0;
-    final inRange =
-        _connected && _lastRssi != null && _estimatedDist <= _maxDist;
-
     return Center(
       child: ScaleTransition(
         scale: _connected ? _pulseAnim : const AlwaysStoppedAnimation(1.0),
@@ -738,16 +860,13 @@ class _MainhomeState extends State<Mainhome>
                   color: kBeige.withOpacity(0.5),
                 ),
               ),
-              // 진행 원
-              SizedBox(
+              // 상태 원
+              Container(
                 width: 200.w,
                 height: 200.w,
-                child: CircularProgressIndicator(
-                  value: ratio.clamp(0.0, 1.0),
-                  strokeWidth: 12,
-                  backgroundColor: kBeige,
-                  color: _zoneColor,
-                  strokeCap: StrokeCap.round,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: _zoneColor, width: 10),
                 ),
               ),
               // 내부 콘텐츠
@@ -755,15 +874,13 @@ class _MainhomeState extends State<Mainhome>
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Icon(
-                    inRange ? Icons.person_pin_circle : Icons.person_off,
+                    _isNear ? Icons.person_pin_circle : Icons.person_off,
                     size: 36,
                     color: _zoneColor,
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    _connected && _lastRssi != null
-                        ? '${_estimatedDist.toStringAsFixed(1)}m'
-                        : '--',
+                    _connected && _lastRssi != null ? '${_lastRssi} dBm' : '--',
                     style: TextStyle(
                       fontSize: 36.sp,
                       fontWeight: FontWeight.w700,
@@ -773,16 +890,11 @@ class _MainhomeState extends State<Mainhome>
                   Text(
                     _zoneLabel,
                     style: TextStyle(
-                      fontSize: 13.sp,
+                      fontSize: 15.sp,
                       color: _zoneColor,
-                      fontWeight: FontWeight.w600,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
-                  if (_connected && _lastRssi != null)
-                    Text(
-                      '${_lastRssi} dBm',
-                      style: TextStyle(fontSize: 11.sp, color: kGrey),
-                    ),
                 ],
               ),
             ],
@@ -900,7 +1012,7 @@ class _MainhomeState extends State<Mainhome>
                   ),
                   const Spacer(),
                   Text(
-                    '감지 범위 ${_maxDist.toStringAsFixed(1)}m',
+                    _isNearMode ? '가까움 감지' : '멀어짐 감지',
                     style: TextStyle(fontSize: 12.sp, color: kGrey),
                   ),
                   const SizedBox(width: 8),
@@ -922,62 +1034,76 @@ class _MainhomeState extends State<Mainhome>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Divider(color: kBeige),
+                  const SizedBox(height: 12),
+                  const Text(
+                    '감지 범위',
+                    style: TextStyle(fontSize: 13, color: kGrey),
+                  ),
                   const SizedBox(height: 8),
-                  _settingSlider(
-                    label: '감지 거리',
-                    value: _maxDist,
-                    min: 0.5,
-                    max: 5.0,
-                    divisions: 45,
-                    display: '${_maxDist.toStringAsFixed(1)}m',
-                    color: kBrown,
-                    onChanged: (v) {
-                      setState(() => _maxDist = v);
-                      _saveSettings();
-                    },
-                  ),
-                  _settingSlider(
-                    label: 'TX Power (1m 기준)',
-                    value: _txPower,
-                    min: -80,
-                    max: -40,
-                    divisions: 40,
-                    display: '${_txPower.round()} dBm',
-                    color: kBrown,
-                    onChanged: (v) {
-                      setState(() => _txPower = v);
-                      _saveSettings();
-                    },
-                  ),
-                  _settingSlider(
-                    label: '환경 계수 n',
-                    value: _pathN,
-                    min: 1.0,
-                    max: 5.0,
-                    divisions: 40,
-                    display: _pathN.toStringAsFixed(1),
-                    color: kBrown,
-                    onChanged: (v) {
-                      setState(() => _pathN = v);
-                      _saveSettings();
-                    },
-                  ),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton(
-                      onPressed: () {
-                        setState(() {
-                          _txPower = -59.0;
-                          _pathN = 2.0;
-                          _maxDist = 3.0;
-                        });
-                        _saveSettings();
-                      },
-                      child: const Text(
-                        '초기화',
-                        style: TextStyle(color: kGrey, fontSize: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () {
+                            setState(() => _isNearMode = true);
+                            _saveSettings();
+                          },
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 200),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            decoration: BoxDecoration(
+                              color: _isNearMode ? kGreen : kBg,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: _isNearMode ? kGreen : kBeige,
+                                width: 1.5,
+                              ),
+                            ),
+                            child: Center(
+                              child: Text(
+                                '가까운 범위',
+                                style: TextStyle(
+                                  fontSize: 14.sp,
+                                  fontWeight: FontWeight.w700,
+                                  color: _isNearMode ? Colors.white : kGrey,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () {
+                            setState(() => _isNearMode = false);
+                            _saveSettings();
+                          },
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 200),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            decoration: BoxDecoration(
+                              color: !_isNearMode ? kRed : kBg,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: !_isNearMode ? kRed : kBeige,
+                                width: 1.5,
+                              ),
+                            ),
+                            child: Center(
+                              child: Text(
+                                '넓은 범위',
+                                style: TextStyle(
+                                  fontSize: 14.sp,
+                                  fontWeight: FontWeight.w700,
+                                  color: !_isNearMode ? Colors.white : kGrey,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -992,144 +1118,213 @@ class _MainhomeState extends State<Mainhome>
     );
   }
 
-  Widget _settingSlider({
-    required String label,
-    required double value,
-    required double min,
-    required double max,
-    required int divisions,
-    required String display,
-    required Color color,
-    required ValueChanged<double> onChanged,
-  }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(
-              label,
-              style: TextStyle(fontSize: 12.sp, color: kGrey),
-            ),
-            Text(
-              display,
-              style: TextStyle(
-                fontSize: 12.sp,
-                color: kBrownDeep,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ],
-        ),
-        SliderTheme(
-          data: SliderTheme.of(context).copyWith(
-            activeTrackColor: color,
-            thumbColor: color,
-            overlayColor: color.withOpacity(0.15),
-            inactiveTrackColor: kBeige,
-            trackHeight: 4,
-          ),
-          child: Slider(
-            value: value.clamp(min, max),
-            min: min,
-            max: max,
-            divisions: divisions,
-            onChanged: onChanged,
-          ),
-        ),
-      ],
-    );
-  }
-
-  // ── 송신 카드 ─────────────────────────────────────────────
-  Widget _buildSendCard() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: kCard,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.04),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
+  void _showAlarmSettings() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kCard,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setModalState) => Padding(
+          padding: EdgeInsets.fromLTRB(
+            20,
+            16,
+            20,
+            MediaQuery.of(ctx).padding.bottom + 24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.send, color: kBrown, size: 20),
-              const SizedBox(width: 10),
-              Text(
-                '데이터 전송',
+              // 핸들
+              Center(
+                child: Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: kBeige,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                '알람 설정',
                 style: TextStyle(
-                  fontSize: 14.sp,
+                  fontSize: 17,
                   fontWeight: FontWeight.w700,
                   color: kBrownDeep,
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _txController,
-                  enabled: _connected,
-                  decoration: InputDecoration(
-                    hintText: _connected ? '보낼 데이터 입력...' : '연결 후 사용 가능',
-                    hintStyle: const TextStyle(color: kGrey, fontSize: 13),
-                    filled: true,
-                    fillColor: kBg,
-                    isDense: true,
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
-                      borderSide: BorderSide.none,
-                    ),
+              const SizedBox(height: 20),
+              // 알람 방식
+              const Text('알람 방식', style: TextStyle(fontSize: 13, color: kGrey)),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  _alarmModeBtn2(0, Icons.vibration, '진동', setModalState),
+                  const SizedBox(width: 8),
+                  _alarmModeBtn2(
+                    1,
+                    Icons.volume_up_rounded,
+                    '소리',
+                    setModalState,
                   ),
-                  onSubmitted: (_) => _sendData(),
-                  textInputAction: TextInputAction.send,
-                ),
-              ),
-              const SizedBox(width: 8),
-              GestureDetector(
-                onTap: (_connected && !_isSending) ? _sendData : null,
-                child: Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: _connected ? kBrown : kBeige,
-                    borderRadius: BorderRadius.circular(10),
+                  const SizedBox(width: 8),
+                  _alarmModeBtn2(
+                    2,
+                    Icons.notifications_active_rounded,
+                    '진동+소리',
+                    setModalState,
                   ),
-                  child: _isSending
-                      ? const Padding(
-                          padding: EdgeInsets.all(12),
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(Icons.send, color: Colors.white, size: 20),
-                ),
+                ],
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
 
-  // ── 로그 카드 ─────────────────────────────────────────────
-  Widget _buildLogCard() {
+  Widget _alarmModeBtn2(
+    int mode,
+    IconData icon,
+    String label,
+    StateSetter setModalState,
+  ) {
+    final selected = _alarmMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () {
+          setState(() => _alarmMode = mode);
+          setModalState(() {});
+          _saveSettings();
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            color: selected ? kBrown : kBg,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: selected ? kBrown : kBeige, width: 1.5),
+          ),
+          child: Column(
+            children: [
+              Icon(icon, size: 22, color: selected ? Colors.white : kGrey),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: selected ? Colors.white : kGrey,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _alarmModeBtn(int mode, IconData icon, String label) {
+    final selected = _alarmMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () {
+          setState(() => _alarmMode = mode);
+          _saveSettings();
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: selected ? kBrown : kBg,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: selected ? kBrown : kBeige, width: 1.5),
+          ),
+          child: Column(
+            children: [
+              Icon(icon, size: 20, color: selected ? Colors.white : kGrey),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 10.sp,
+                  fontWeight: FontWeight.w600,
+                  color: selected ? Colors.white : kGrey,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── 알람 배너 ─────────────────────────────────────────────
+  Widget _buildAlarmBanner() {
+    return GestureDetector(
+      onTap: _stopAlarm,
+      child: Container(
+        width: double.infinity,
+        margin: EdgeInsets.only(bottom: 16.h),
+        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+        decoration: BoxDecoration(
+          color: kRed,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: kRed.withOpacity(0.4),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '⚠️ 범위 초과!',
+                  style: TextStyle(
+                    fontSize: 16.sp,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+                Text(
+                  '탭하여 알람 끄기',
+                  style: TextStyle(fontSize: 12.sp, color: Colors.white70),
+                ),
+              ],
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                '알람 끄기',
+                style: TextStyle(
+                  fontSize: 13.sp,
+                  fontWeight: FontWeight.w700,
+                  color: kRed,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRecvCard() {
     return Container(
       decoration: BoxDecoration(
         color: kCard,
@@ -1144,144 +1339,83 @@ class _MainhomeState extends State<Mainhome>
       ),
       child: Column(
         children: [
-          GestureDetector(
-            onTap: () => setState(() => _showLog = !_showLog),
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Row(
-                children: [
-                  const Icon(Icons.history, color: kBrown, size: 20),
-                  const SizedBox(width: 10),
-                  Text(
-                    '송수신 로그',
-                    style: TextStyle(
-                      fontSize: 14.sp,
-                      fontWeight: FontWeight.w700,
-                      color: kBrownDeep,
-                    ),
+          // 헤더
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                const Icon(Icons.inbox_rounded, color: kBrown, size: 20),
+                const SizedBox(width: 10),
+                Text(
+                  '수신 데이터',
+                  style: TextStyle(
+                    fontSize: 14.sp,
+                    fontWeight: FontWeight.w700,
+                    color: kBrownDeep,
                   ),
-                  const Spacer(),
-                  if (_log.isNotEmpty)
-                    Text(
-                      '${_log.length}건',
+                ),
+                const Spacer(),
+                Text(
+                  _batteryMv == null ? '배터리: -' : '배터리: ${_batteryMv}mV',
+                  style: TextStyle(fontSize: 12.sp, color: kGrey),
+                ),
+                const SizedBox(width: 8),
+                if (_lastRecv != '-')
+                  Flexible(
+                    child: Text(
+                      '최근: $_lastRecv',
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 12.sp, color: kGrey),
                     ),
-                  const SizedBox(width: 8),
-                  Icon(
-                    _showLog ? Icons.expand_less : Icons.expand_more,
-                    color: kGrey,
-                    size: 20,
                   ),
-                ],
-              ),
-            ),
-          ),
-          AnimatedCrossFade(
-            firstChild: const SizedBox.shrink(),
-            secondChild: Column(
-              children: [
-                const Divider(color: kBeige, height: 1),
-                SizedBox(
-                  height: 200.h,
-                  child: _log.isEmpty
-                      ? const Center(
-                          child: Text(
-                            '아직 데이터가 없습니다.',
-                            style: TextStyle(color: kGrey, fontSize: 13),
-                          ),
-                        )
-                      : ListView.builder(
-                          padding: const EdgeInsets.symmetric(vertical: 4),
-                          itemCount: _log.length,
-                          itemBuilder: (_, i) {
-                            final e = _log[i];
-                            final isTx = e.direction == _Dir.tx;
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 3,
-                              ),
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    isTx
-                                        ? Icons.arrow_upward_rounded
-                                        : Icons.arrow_downward_rounded,
-                                    size: 12,
-                                    color: isTx ? kBrown : kGreen,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    e.timeStr,
-                                    style: TextStyle(
-                                      fontSize: 11.sp,
-                                      color: kGrey,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      e.text,
-                                      style: TextStyle(
-                                        fontSize: 13.sp,
-                                        color: isTx ? kBrown : kBrownDeep,
-                                        fontWeight: isTx
-                                            ? FontWeight.w600
-                                            : FontWeight.normal,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
-                        ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: GestureDetector(
-                      onTap: () => setState(() {
-                        _log.clear();
-                        _lastRecv = '-';
-                      }),
-                      child: Text(
-                        '로그 지우기',
-                        style: TextStyle(
-                          fontSize: 12.sp,
-                          color: kGrey,
-                          decoration: TextDecoration.underline,
-                        ),
-                      ),
-                    ),
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: () => setState(() => _recvLog.clear()),
+                  child: const Icon(
+                    Icons.delete_outline,
+                    color: kGrey,
+                    size: 18,
                   ),
                 ),
               ],
             ),
-            crossFadeState: _showLog
-                ? CrossFadeState.showSecond
-                : CrossFadeState.showFirst,
-            duration: const Duration(milliseconds: 250),
+          ),
+          // 로그
+          Container(
+            height: 120.h,
+            margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            decoration: BoxDecoration(
+              color: kBg,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: _recvLog.isEmpty
+                ? Center(
+                    child: Text(
+                      '수신된 데이터가 없습니다.',
+                      style: TextStyle(fontSize: 12.sp, color: kGrey),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    itemCount: _recvLog.length,
+                    itemBuilder: (_, i) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text(
+                        _recvLog[i],
+                        style: TextStyle(
+                          fontSize: 13.sp,
+                          color: kBrownDeep,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                  ),
           ),
         ],
       ),
     );
   }
-}
-
-enum _Dir { tx, rx }
-
-class _LogEntry {
-  final _Dir direction;
-  final String text;
-  final String timeStr;
-
-  _LogEntry({required this.direction, required this.text})
-    : timeStr = _fmt(DateTime.now());
-
-  static String _fmt(DateTime t) =>
-      '${t.hour.toString().padLeft(2, '0')}:'
-      '${t.minute.toString().padLeft(2, '0')}:'
-      '${t.second.toString().padLeft(2, '0')}';
 }
