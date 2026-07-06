@@ -5,6 +5,7 @@ import 'package:distance/screens/scan_page.dart';
 import 'package:distance/widgets/foreground.dart';
 import 'package:distance/widgets/rssiguard.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
@@ -64,10 +65,10 @@ class _MainhomeState extends State<Mainhome>
   final StringBuffer _rxBuf = StringBuffer();
 
   // RSSI 임계값
-  static const double _rssiNear = -85.0; // 가까운 범위
-  static const double _rssiFar = -89.0; // 넓은 범위
-  bool _isNearMode = true; // true=가까운 범위(-80), false=넓은 범위(-88)
-  double get _alertRssi => _isNearMode ? _rssiNear : _rssiFar;
+  static const double _rssiNear = -68.0; // 가까운 범위 (~5m)
+  static const double _rssiFar = -82.0; // 넓은 범위 (~10m)
+  int _rangeMode = 0; // 0=가까운, 1=넓은
+  double get _alertRssi => _rangeMode == 0 ? _rssiNear : _rssiFar;
 
   // 진동 감지
   int _consecutiveOver = 0;
@@ -77,10 +78,16 @@ class _MainhomeState extends State<Mainhome>
 
   // 알람 상태
   bool _alarmActive = false;
+  bool _alarmCooldown = false; // 알람 끈 후 범위 안 들어올 때까지 차단
   Timer? _alarmTimer;
 
+  // 기기 관리자 채널
+  static const _adminChannel = MethodChannel(
+    'com.example.distance/device_admin',
+  );
+
   // 알람 모드 (0=진동, 1=소리, 2=진동&소리)
-  int _alarmMode = 0;
+  int _alarmMode = 2;
 
   // 펄스 애니메이션
   late AnimationController _pulseCtrl;
@@ -118,6 +125,7 @@ class _MainhomeState extends State<Mainhome>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _restoreConnectIntent();
       _requestBatteryOpt();
+      _checkDeviceAdmin(); // 기기 관리자 등록 확인
     });
   }
 
@@ -156,14 +164,14 @@ class _MainhomeState extends State<Mainhome>
   Future<void> _loadSettings() async {
     final p = await SharedPreferences.getInstance();
     setState(() {
-      _isNearMode = p.getBool('is_near_mode') ?? true;
-      _alarmMode = p.getInt('alarm_mode') ?? 0;
+      _rangeMode = p.getInt('range_mode') ?? 0;
+      _alarmMode = p.getInt('alarm_mode') ?? 2;
     });
   }
 
   Future<void> _saveSettings() async {
     final p = await SharedPreferences.getInstance();
-    await p.setBool('is_near_mode', _isNearMode);
+    await p.setInt('range_mode', _rangeMode);
     await p.setInt('alarm_mode', _alarmMode);
   }
 
@@ -495,10 +503,13 @@ class _MainhomeState extends State<Mainhome>
 
         if (mounted) setState(() => _lastRssi = rssi);
 
-        // 알람 활성 중이면 무조건 1 전송
-        // 알람 꺼진 상태에서만 isOver 판단
+        // 알람 활성 중 → 1
+        // 쿨다운 중   → 0
+        // 그 외       → isOver 판단
         if (_alarmActive) {
           await _sendValue('1');
+        } else if (_alarmCooldown) {
+          await _sendValue('0');
         } else {
           await _sendValue(isOver ? '1' : '0');
         }
@@ -507,6 +518,13 @@ class _MainhomeState extends State<Mainhome>
         if (isOver) {
           _consecutiveOver++;
         } else {
+          // 범위 안으로 돌아오면
+          if (_alarmActive) {
+            _stopAlarm(); // 알람 자동 종료
+          }
+          if (_alarmCooldown) {
+            setState(() => _alarmCooldown = false);
+          }
           _consecutiveOver = 0;
         }
 
@@ -520,14 +538,47 @@ class _MainhomeState extends State<Mainhome>
 
   final AudioPlayer _audioPlayer = AudioPlayer();
 
+  // 앱 시작 시 기기 관리자 등록 확인
+  Future<void> _checkDeviceAdmin() async {
+    try {
+      final isAdmin =
+          await _adminChannel.invokeMethod<bool>('isAdminActive') ?? false;
+      if (!isAdmin) {
+        await _adminChannel.invokeMethod('requestAdmin');
+      }
+    } catch (e) {
+      debugPrint('[ADMIN] 기기 관리자 확인 실패: $e');
+    }
+  }
+
+  // 화면 잠금
+  Future<void> _lockScreen() async {
+    try {
+      final isAdmin =
+          await _adminChannel.invokeMethod<bool>('isAdminActive') ?? false;
+      if (isAdmin) {
+        await _adminChannel.invokeMethod('lockScreen');
+      } else {
+        // 관리자 권한 없으면 등록 요청
+        await _adminChannel.invokeMethod('requestAdmin');
+      }
+    } catch (e) {
+      debugPrint('[LOCK] 화면 잠금 실패: $e');
+    }
+  }
+
   Future<void> _maybeVibrate() async {
     if (_alarmActive) return;
+    if (_alarmCooldown) return;
     _startAlarm();
   }
 
   void _startAlarm() {
     setState(() => _alarmActive = true);
     _alarmCtrl.repeat(reverse: true);
+
+    // 화면 잠금
+    _lockScreen();
 
     // 백그라운드일 때만 포그라운드 알림 갱신
     if (_isBackground) {
@@ -576,7 +627,10 @@ class _MainhomeState extends State<Mainhome>
     _alarmCtrl.reset();
     Vibration.cancel();
     _audioPlayer.stop();
-    setState(() => _alarmActive = false);
+    setState(() {
+      _alarmActive = false;
+      _alarmCooldown = true; // 범위 안으로 돌아올 때까지 차단
+    });
     _sendValue('0');
 
     // 포그라운드 알림 원래대로
@@ -738,7 +792,7 @@ class _MainhomeState extends State<Mainhome>
                   SizedBox(height: 16.h),
                   _buildSettingsCard(),
                   SizedBox(height: 16.h),
-                  _buildRecvCard(),
+                  // _buildRecvCard(), // 숨김
                   SizedBox(height: 24.h),
                 ],
               ),
@@ -1042,7 +1096,7 @@ class _MainhomeState extends State<Mainhome>
                   ),
                   const Spacer(),
                   Text(
-                    _isNearMode ? '가까움 감지' : '멀어짐 감지',
+                    _rangeMode == 0 ? '가까운 범위' : '넓은 범위',
                     style: TextStyle(fontSize: 12.sp, color: kGrey),
                   ),
                   const SizedBox(width: 8),
@@ -1075,17 +1129,17 @@ class _MainhomeState extends State<Mainhome>
                       Expanded(
                         child: GestureDetector(
                           onTap: () {
-                            setState(() => _isNearMode = true);
+                            setState(() => _rangeMode = 0);
                             _saveSettings();
                           },
                           child: AnimatedContainer(
                             duration: const Duration(milliseconds: 200),
                             padding: const EdgeInsets.symmetric(vertical: 14),
                             decoration: BoxDecoration(
-                              color: _isNearMode ? kGreen : kBg,
+                              color: _rangeMode == 0 ? kGreen : kBg,
                               borderRadius: BorderRadius.circular(12),
                               border: Border.all(
-                                color: _isNearMode ? kGreen : kBeige,
+                                color: _rangeMode == 0 ? kGreen : kBeige,
                                 width: 1.5,
                               ),
                             ),
@@ -1093,9 +1147,9 @@ class _MainhomeState extends State<Mainhome>
                               child: Text(
                                 '가까운 범위',
                                 style: TextStyle(
-                                  fontSize: 14.sp,
+                                  fontSize: 13.sp,
                                   fontWeight: FontWeight.w700,
-                                  color: _isNearMode ? Colors.white : kGrey,
+                                  color: _rangeMode == 0 ? Colors.white : kGrey,
                                 ),
                               ),
                             ),
@@ -1106,17 +1160,17 @@ class _MainhomeState extends State<Mainhome>
                       Expanded(
                         child: GestureDetector(
                           onTap: () {
-                            setState(() => _isNearMode = false);
+                            setState(() => _rangeMode = 1);
                             _saveSettings();
                           },
                           child: AnimatedContainer(
                             duration: const Duration(milliseconds: 200),
                             padding: const EdgeInsets.symmetric(vertical: 14),
                             decoration: BoxDecoration(
-                              color: !_isNearMode ? kRed : kBg,
+                              color: _rangeMode == 1 ? kRed : kBg,
                               borderRadius: BorderRadius.circular(12),
                               border: Border.all(
-                                color: !_isNearMode ? kRed : kBeige,
+                                color: _rangeMode == 1 ? kRed : kBeige,
                                 width: 1.5,
                               ),
                             ),
@@ -1124,9 +1178,9 @@ class _MainhomeState extends State<Mainhome>
                               child: Text(
                                 '넓은 범위',
                                 style: TextStyle(
-                                  fontSize: 14.sp,
+                                  fontSize: 13.sp,
                                   fontWeight: FontWeight.w700,
-                                  color: !_isNearMode ? Colors.white : kGrey,
+                                  color: _rangeMode == 1 ? Colors.white : kGrey,
                                 ),
                               ),
                             ),
